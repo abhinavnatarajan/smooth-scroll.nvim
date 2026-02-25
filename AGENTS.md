@@ -22,7 +22,9 @@ Which commands are used depends on `scroll_mode`:
   the viewport automatically when `scrolloff` is reached.
 - `scroll_mode = "viewport"` (**viewport-only**): only `<C-e>`/`<C-y>`. No
   drift correction — the cursor stays on the same buffer line. Used by
-  `zt`/`zz`/`zb`.
+  `zt`/`zz`/`zb`. When the viewport hits a buffer boundary (top or bottom),
+  remaining lines automatically fall back to cursor movement (`gj`/`gk`) so
+  the cursor continues toward the buffer edge instead of halting.
 - `scroll_mode = "both"` (**viewport-led with drift correction**):
   `<C-e>`/`<C-y>` scrolls the viewport; `gj`/`gk` drift correction keeps the
   cursor pinned at its original screen-line position (winline).
@@ -53,10 +55,19 @@ One `vim.uv.new_timer()` is created for the plugin's lifetime. It is
 stopped/restarted per animation. This avoids GC pressure from creating timers on
 every scroll.
 
-### Interruption = restart
+### Interruption behaviour
 
-A new scroll input stops the current timer and starts a fresh animation from the
-current viewport position. No queuing or blending.
+Controlled by the `interrupt_behaviour` option (`"cancel"` or `"accumulate"`).
+
+- `"cancel"` (default): a new scroll input stops the current timer and starts a
+  fresh animation from the current viewport position. Remaining distance is
+  discarded. No queuing or blending.
+- `"accumulate"`: when the new scroll is in the **same direction** as the
+  running animation, unscrolled lines from the cancelled animation are added to
+  the new one (clamped to `MAX_ACCUMULATE_LINES` in `scroller.lua`, default
+  200). Opposite-direction scrolls still cancel normally. This is the default
+  for scroll-wheel keymaps so that rapid wheel input builds momentum instead of
+  restarting from scratch each time.
 
 ### Peek-and-animate strategy
 
@@ -174,9 +185,23 @@ calls inside timer callbacks MUST be wrapped with `vim.schedule_wrap()`.
 `at_boundary()` checks if the scroll tick had any effect. In cursor-led mode
 (`scroll_mode = "cursor"`), it compares cursor position (line + col) before and
 after `gj`/`gk`. In viewport-led modes (`scroll_mode = "viewport"` or
-`"both"`), it compares `topline` before and after `<C-e>`/`<C-y>`. Either way,
-no change means the buffer boundary has been reached and the animation stops
-early.
+`"both"`), it compares `topline` before and after `<C-e>`/`<C-y>`. In `"both"`
+and `"cursor"` modes, a boundary means the animation stops early. In
+`"viewport"` mode, a viewport boundary triggers a fallback: the
+`viewport_at_boundary` flag is set on the animation state, and remaining lines
+(in the current tick and all subsequent ticks) are scrolled via cursor movement
+(`gj`/`gk`) instead. The animation only truly stops when the cursor itself
+can no longer move.
+
+**Bottom boundary detection**: When scrolling down in `"viewport"` mode,
+`<C-e>` can continue advancing `topline` long after the last buffer line is
+visible, filling the screen with `~` lines. To prevent this, after each
+`<C-e>`, if the last buffer line is within the window (`line("w$") >=
+last_buf_line`), the number of empty `~` lines below it is computed using
+`screenpos()` and `getwininfo()`. When `empty_below >= viewport_bottom_margin`,
+the `viewport_at_boundary` flag is set and remaining lines fall back to cursor
+movement. `viewport_bottom_margin` defaults to `nil` (uses the window's
+`scrolloff`); it can be overridden per-keymap or per-call.
 
 ### Default keymaps
 
@@ -196,12 +221,14 @@ Keymaps can be disabled by setting them to `false` in config.
 
 ### Config defaults
 
-- `duration`: 150ms
+- `duration`: `fun(lines) return lines * 12 end` (scales with distance)
 - `easing`: `"ease_in_out_quad"`
 - `max_fps`: 60
 - `scroll_mode`: `"cursor"`
 - `disable_events`: true
 - `mouse_wheel_lines`: 3
+- `interrupt_behaviour`: `"cancel"`
+- `viewport_bottom_margin`: `nil` (uses window's `scrolloff`)
 
 ## Testing Notes
 

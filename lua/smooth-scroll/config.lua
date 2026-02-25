@@ -22,6 +22,26 @@
 ---
 ---@alias SmoothScrollMode "cursor"|"viewport"|"both"
 
+--- Interrupt behaviour controls what happens when a new scroll is triggered
+--- while an animation is already in progress.
+---
+--- - `"cancel"`: the running animation is stopped and its remaining distance
+---   is discarded.  The new scroll starts from scratch.
+--- - `"accumulate"`: if the new scroll is in the **same direction** as the
+---   running animation, any unscrolled lines from the cancelled animation are
+---   added to the new one.  Opposite-direction scrolls still cancel normally.
+---   The accumulated total is clamped to a developer-tunable maximum (see
+---   `MAX_ACCUMULATE_LINES` in `scroller.lua`).
+---
+---@alias SmoothScrollInterruptBehaviour "cancel"|"accumulate"
+
+--- Duration may be a fixed number of milliseconds or a function that receives
+--- the total number of screen lines to scroll and returns the duration in
+--- milliseconds.  Using a function allows the animation speed to scale with
+--- distance.
+---
+---@alias SmoothScrollDuration integer|fun(lines: integer): integer
+
 --- Per-keymap configuration entry.
 ---
 --- Each entry maps a key sequence to a named motion function and optionally
@@ -30,31 +50,39 @@
 ---@class SmoothScrollKeymap
 ---@field motion string Name of the motion function (e.g. `"half_page_down"`).
 ---@field modes? string|string[] Vim mode(s) to create the mapping in. Defaults to `{ "n", "x" }`.
----@field duration? number Override global `duration` for this keymap (ms).
+---@field duration? SmoothScrollDuration Override global `duration` for this keymap.
 ---@field easing? SmoothScrollEasingName|SmoothScrollEasingFn Override global easing for this keymap.
 ---@field scroll_mode? SmoothScrollMode Override global `scroll_mode` for this keymap.
 ---@field max_fps? number Override global `max_fps` for this keymap.
+---@field disable_events? boolean Override global `disable_events` for this keymap.
+---@field mouse_wheel_lines? number Override global `mouse_wheel_lines` for this keymap.
+---@field interrupt_behaviour? SmoothScrollInterruptBehaviour Override global `interrupt_behaviour` for this keymap.
+---@field viewport_bottom_margin? integer Override global `viewport_bottom_margin` for this keymap.
 
 --- Full plugin configuration.
 ---
 ---@class SmoothScrollConfig
----@field duration number Total animation duration in milliseconds.
+---@field duration SmoothScrollDuration Animation duration — either a fixed number of milliseconds or a `fun(lines): ms` that scales with distance.
 ---@field easing SmoothScrollEasingName|SmoothScrollEasingFn Easing function name or a custom `fun(t):number`.
 ---@field max_fps number Maximum frames per second — controls the upper bound on tick rate. Clamped to [1, 250].
 ---@field scroll_mode SmoothScrollMode Controls how cursor and viewport interact during scrolling. See `SmoothScrollMode`.
 ---@field disable_events boolean Whether to suppress `WinScrolled`/`CursorMoved` autocommands during animation.
 ---@field mouse_wheel_lines number Number of screen lines to scroll per mouse wheel event. Defaults to `3`.
+---@field interrupt_behaviour SmoothScrollInterruptBehaviour Controls what happens when a new scroll interrupts a running animation. See `SmoothScrollInterruptBehaviour`.
+---@field viewport_bottom_margin? integer Number of empty `~` lines below the last buffer line that triggers cursor-movement fallback in `"viewport"` scroll mode when scrolling down. `nil` (default) uses the window's `scrolloff` value.
 ---@field keymaps table<string, SmoothScrollKeymap|false> Map from key sequence to keymap config.  Set a value to `false` to disable a default keymap.
 
 --- Per-call option overrides that may be passed to any scroll function.
 ---
 ---@class SmoothScrollOpts
----@field duration? number Override animation duration (ms).
+---@field duration? SmoothScrollDuration Override animation duration.
 ---@field easing? SmoothScrollEasingName|SmoothScrollEasingFn Override easing function.
 ---@field max_fps? number Override maximum frames per second.
 ---@field scroll_mode? SmoothScrollMode Override scroll mode (cursor/viewport/both).
 ---@field disable_events? boolean Override event suppression behaviour.
 ---@field mouse_wheel_lines? number Override number of screen lines per mouse wheel event.
+---@field interrupt_behaviour? SmoothScrollInterruptBehaviour Override interrupt behaviour for this call.
+---@field viewport_bottom_margin? integer Override viewport bottom margin for this call. See `SmoothScrollConfig.viewport_bottom_margin`.
 ---@field on_complete? fun() Callback invoked when the scroll animation finishes.
 ---@field win? integer Target window handle (from `nvim_get_current_win()` or similar). When set, scrolling is performed in this window. If the target is not the current window, `scroll_mode` is forced to `"viewport"` — only the viewport moves, the cursor is not touched. `0` or `nil` means the current window.
 
@@ -72,12 +100,13 @@ local M = {}
 ---
 ---@type SmoothScrollConfig
 M.defaults = {
-  duration = 150,
+  duration = function(lines) return lines * 12 end,
   easing = "linear",
   max_fps = 60,
-  scroll_mode = "cursor",
+  scroll_mode = "viewport",
   disable_events = true,
   mouse_wheel_lines = 3,
+  interrupt_behaviour = "cancel",
   keymaps = {
     ["<C-d>"] = { motion = "half_page_down", modes = { "n", "x", "o" } },
     ["<C-u>"] = { motion = "half_page_up", modes = { "n", "x", "o" } },
@@ -86,8 +115,22 @@ M.defaults = {
     ["zt"] = { motion = "center_top", modes = "n" },
     ["zz"] = { motion = "center", modes = "n" },
     ["zb"] = { motion = "center_bottom", modes = "n" },
-    ["<ScrollWheelDown>"] = { motion = "scroll_wheel_down", modes = { "n", "x", "i" } },
-    ["<ScrollWheelUp>"] = { motion = "scroll_wheel_up", modes = { "n", "x", "i" } },
+    ["<ScrollWheelDown>"] = {
+      motion = "scroll_wheel_down",
+      modes = { "n", "x", "i" },
+      scroll_mode = "viewport",
+      mouse_wheel_lines = 1,
+      duration = 100,
+      interrupt_behaviour = "accumulate",
+    },
+    ["<ScrollWheelUp>"] = {
+      motion = "scroll_wheel_up",
+      modes = { "n", "x", "i" },
+      scroll_mode = "viewport",
+      mouse_wheel_lines = 1,
+      duration = 100,
+      interrupt_behaviour = "accumulate",
+    },
   },
 }
 
@@ -142,19 +185,26 @@ end
 ---@param opts? SmoothScrollOpts Per-call overrides.
 ---@return SmoothScrollConfig effective The effective option set for this call.
 function M.resolve(opts)
-  if not opts or vim.tbl_isempty(opts) then
+  if not opts or next(opts) == nil then
     return M.current
   end
-  local result = vim.tbl_deep_extend("force", {
-    duration = M.current.duration,
-    easing = M.current.easing,
-    max_fps = M.current.max_fps,
-    scroll_mode = M.current.scroll_mode,
-    disable_events = M.current.disable_events,
-    mouse_wheel_lines = M.current.mouse_wheel_lines,
-    -- win is per-call only (not in defaults), so it comes purely from opts
-  }, opts)
-  return result
+  -- Manual shallow merge: all config fields are scalar, so
+  -- vim.tbl_deep_extend overhead is unnecessary.  For booleans use
+  -- the ~= nil pattern to preserve explicit `false` values.
+  local cur = M.current
+  return {
+    duration = opts.duration or cur.duration,
+    easing = opts.easing or cur.easing,
+    max_fps = opts.max_fps or cur.max_fps,
+    scroll_mode = opts.scroll_mode or cur.scroll_mode,
+    disable_events = opts.disable_events ~= nil and opts.disable_events or cur.disable_events,
+    mouse_wheel_lines = opts.mouse_wheel_lines or cur.mouse_wheel_lines,
+    interrupt_behaviour = opts.interrupt_behaviour or cur.interrupt_behaviour,
+    viewport_bottom_margin = opts.viewport_bottom_margin ~= nil and opts.viewport_bottom_margin or cur.viewport_bottom_margin,
+    -- Per-call only fields (not in defaults)
+    win = opts.win,
+    on_complete = opts.on_complete,
+  }
 end
 
 return M

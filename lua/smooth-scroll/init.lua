@@ -12,6 +12,11 @@ local scroller = require("smooth-scroll.scroller")
 ---@class smooth-scroll
 local M = {}
 
+--- Pre-allocated opts table for viewport-only motions (zt/zz/zb) when no
+--- per-call overrides are provided.  Avoids a table allocation per call.
+---@type SmoothScrollOpts
+local viewport_opts = { scroll_mode = "viewport" }
+
 ---------------------------------------------------------------------------
 -- State query
 ---------------------------------------------------------------------------
@@ -134,7 +139,11 @@ end
 ---
 ---@param opts? SmoothScrollOpts Per-call overrides.
 function M.center_top(opts)
-  opts = vim.tbl_extend("force", opts or {}, { scroll_mode = "viewport" })
+  if opts then
+    opts = { scroll_mode = "viewport", duration = opts.duration, easing = opts.easing, max_fps = opts.max_fps, disable_events = opts.disable_events, win = opts.win, viewport_bottom_margin = opts.viewport_bottom_margin, interrupt_behaviour = opts.interrupt_behaviour }
+  else
+    opts = viewport_opts
+  end
   scroller.scroll_to_target("zt", opts)
 end
 
@@ -146,7 +155,11 @@ end
 ---
 ---@param opts? SmoothScrollOpts Per-call overrides.
 function M.center(opts)
-  opts = vim.tbl_extend("force", opts or {}, { scroll_mode = "viewport" })
+  if opts then
+    opts = { scroll_mode = "viewport", duration = opts.duration, easing = opts.easing, max_fps = opts.max_fps, disable_events = opts.disable_events, win = opts.win, viewport_bottom_margin = opts.viewport_bottom_margin, interrupt_behaviour = opts.interrupt_behaviour }
+  else
+    opts = viewport_opts
+  end
   scroller.scroll_to_target("zz", opts)
 end
 
@@ -158,7 +171,11 @@ end
 ---
 ---@param opts? SmoothScrollOpts Per-call overrides.
 function M.center_bottom(opts)
-  opts = vim.tbl_extend("force", opts or {}, { scroll_mode = "viewport" })
+  if opts then
+    opts = { scroll_mode = "viewport", duration = opts.duration, easing = opts.easing, max_fps = opts.max_fps, disable_events = opts.disable_events, win = opts.win, viewport_bottom_margin = opts.viewport_bottom_margin, interrupt_behaviour = opts.interrupt_behaviour }
+  else
+    opts = viewport_opts
+  end
   scroller.scroll_to_target("zb", opts)
 end
 
@@ -173,8 +190,7 @@ end
 ---
 ---@param opts? SmoothScrollOpts Per-call overrides.
 function M.scroll_wheel_down(opts)
-  local resolved = config.resolve(opts)
-  local lines = resolved.mouse_wheel_lines or 3
+  local lines = (opts and opts.mouse_wheel_lines) or config.current.mouse_wheel_lines or 3
   scroller.scroll(lines, opts)
 end
 
@@ -185,8 +201,7 @@ end
 ---
 ---@param opts? SmoothScrollOpts Per-call overrides.
 function M.scroll_wheel_up(opts)
-  local resolved = config.resolve(opts)
-  local lines = resolved.mouse_wheel_lines or 3
+  local lines = (opts and opts.mouse_wheel_lines) or config.current.mouse_wheel_lines or 3
   scroller.scroll(-lines, opts)
 end
 
@@ -247,21 +262,35 @@ function M._setup_keymaps()
     -- Build per-keymap override opts (only if at least one override is set)
     ---@type SmoothScrollOpts?
     local key_opts = nil
-    if keymap.duration or keymap.easing or keymap.scroll_mode or keymap.max_fps then
+    if
+      keymap.duration
+      or keymap.easing
+      or keymap.scroll_mode
+      or keymap.max_fps
+      or keymap.disable_events ~= nil
+      or keymap.mouse_wheel_lines
+      or keymap.interrupt_behaviour
+      or keymap.viewport_bottom_margin
+    then
       key_opts = {
         duration = keymap.duration,
         easing = keymap.easing,
         scroll_mode = keymap.scroll_mode,
         max_fps = keymap.max_fps,
+        disable_events = keymap.disable_events,
+        mouse_wheel_lines = keymap.mouse_wheel_lines,
+        interrupt_behaviour = keymap.interrupt_behaviour,
+        viewport_bottom_margin = keymap.viewport_bottom_margin,
       }
     end
 
     -- Determine modes (normalise string → table)
-    ---@type string[]
+    ---@type string | string[]
     local modes = keymap.modes or { "n", "x" }
     if type(modes) == "string" then
       modes = { modes }
     end
+    ---@cast modes string[]
 
     -- Create the mapping
     vim.keymap.set(modes, lhs, function()

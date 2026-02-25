@@ -17,20 +17,53 @@ local config = require("smooth-scroll.config")
 local M = {}
 
 ---------------------------------------------------------------------------
+-- Upvalue caches for hot-path Neovim API calls
+---------------------------------------------------------------------------
+
+local api = vim.api
+local fn = vim.fn
+local cmd_normal = vim.cmd.normal
+
+local nvim_get_current_win = api.nvim_get_current_win
+local nvim_win_is_valid = api.nvim_win_is_valid
+local nvim_win_call = api.nvim_win_call
+local nvim_win_get_height = api.nvim_win_get_height
+local nvim_get_option_value = api.nvim_get_option_value
+
+local fn_line = fn.line
+local fn_col = fn.col
+local fn_winline = fn.winline
+local fn_winsaveview = fn.winsaveview
+local fn_winrestview = fn.winrestview
+local fn_getwininfo = fn.getwininfo
+local fn_screenpos = fn.screenpos
+
+local math_floor = math.floor
+local math_max = math.max
+local math_min = math.min
+local math_abs = math.abs
+
+---------------------------------------------------------------------------
 -- Pre-computed terminal codes
 ---------------------------------------------------------------------------
 
 --- Terminal code for `<C-e>` (scroll viewport down by one screen line).
 ---@type string
-local CTRL_E = vim.api.nvim_replace_termcodes("<C-e>", false, false, true)
+local CTRL_E = api.nvim_replace_termcodes("<C-e>", false, false, true)
 
 --- Terminal code for `<C-y>` (scroll viewport up by one screen line).
 ---@type string
-local CTRL_Y = vim.api.nvim_replace_termcodes("<C-y>", false, false, true)
+local CTRL_Y = api.nvim_replace_termcodes("<C-y>", false, false, true)
 
 ---------------------------------------------------------------------------
 -- Timer & animation state
 ---------------------------------------------------------------------------
+
+--- Maximum number of screen lines that can accumulate when
+--- `interrupt_behaviour = "accumulate"`.  This prevents runaway accumulation
+--- from very rapid scroll-wheel input.  Not exposed in user config — adjust
+--- here if needed.
+local MAX_ACCUMULATE_LINES = 200
 
 --- Single reused libuv timer for the plugin's lifetime.
 ---@type uv_timer_t
@@ -50,6 +83,9 @@ local timer = vim.uv.new_timer()
 ---@field on_complete? fun() Optional callback invoked when the animation finishes normally or reaches a boundary.
 ---@field saved_eventignore? string Previous value of `vim.o.eventignore`, restored when the animation ends.
 ---@field win integer Target window handle. Resolved to a concrete window ID (never 0) at animation start.
+---@field viewport_at_boundary boolean When `true`, the viewport has hit a buffer boundary during a `"viewport"` mode animation. Subsequent lines fall back to cursor movement (`gj`/`gk`) instead of stopping the animation.
+---@field last_buf_line integer Total number of buffer lines (`vim.fn.line("$")`), precomputed at animation start for bottom boundary detection.
+---@field viewport_bottom_margin integer Number of empty `~` lines below the last buffer line that triggers cursor-movement fallback when scrolling down in `"viewport"` mode.
 
 --- The currently-running animation, or `nil` when idle.
 ---@type SmoothScrollAnimationState?
@@ -109,9 +145,9 @@ local function compute_intervals(total_lines, duration_ms, easing_fn, max_fps)
   end
 
   -- Clamp max_fps to [1, 250]
-  max_fps = math.max(1, math.min(250, max_fps))
+  max_fps = math_max(1, math_min(250, max_fps))
 
-  local max_frames = math.max(1, math.floor(duration_ms * max_fps / 1000))
+  local max_frames = math_max(1, math_floor(duration_ms * max_fps / 1000))
 
   -- For single-line scrolls, just return one tick
   if total_lines == 1 then
@@ -138,7 +174,7 @@ local function compute_intervals(total_lines, duration_ms, easing_fn, max_fps)
       local t0 = (i - 1) / num_ticks
       local t1 = i / num_ticks
       local frac = easing_fn(t1) - easing_fn(t0)
-      local bucket = math.floor(frac * total_lines + 0.5)
+      local bucket = math_floor(frac * total_lines + 0.5)
       if bucket < 1 then
         bucket = 1
       end
@@ -148,7 +184,7 @@ local function compute_intervals(total_lines, duration_ms, easing_fn, max_fps)
 
     -- Fix rounding errors: adjust the last bucket
     local diff = total_lines - assigned
-    lines_per_tick[num_ticks] = math.max(1, lines_per_tick[num_ticks] + diff)
+    lines_per_tick[num_ticks] = math_max(1, lines_per_tick[num_ticks] + diff)
   end
 
   -- Compute easing-based intervals that sum to duration_ms.
@@ -173,7 +209,7 @@ local function compute_intervals(total_lines, duration_ms, easing_fn, max_fps)
   -- Normalise so the intervals sum to duration_ms
   local intervals = {}
   for i = 1, num_ticks do
-    intervals[i] = math.max(1, math.floor((raw_weights[i] / total_weight) * duration_ms + 0.5))
+    intervals[i] = math_max(1, math_floor((raw_weights[i] / total_weight) * duration_ms + 0.5))
   end
 
   return intervals, lines_per_tick
@@ -202,16 +238,16 @@ local function scroll_one_line(direction, scroll_mode)
     -- Cursor-led: just move the cursor; Neovim scrolls the viewport
     -- automatically when the cursor approaches `scrolloff`.
     if direction == 1 then
-      vim.cmd.normal({ bang = true, args = { "gj" } })
+      cmd_normal({ bang = true, args = { "gj" } })
     else
-      vim.cmd.normal({ bang = true, args = { "gk" } })
+      cmd_normal({ bang = true, args = { "gk" } })
     end
   else
     -- Viewport-led ("viewport" or "both"): scroll the viewport directly.
     if direction == 1 then
-      vim.cmd.normal({ bang = true, args = { CTRL_E } })
+      cmd_normal({ bang = true, args = { CTRL_E } })
     else
-      vim.cmd.normal({ bang = true, args = { CTRL_Y } })
+      cmd_normal({ bang = true, args = { CTRL_Y } })
     end
   end
 end
@@ -230,7 +266,7 @@ end
 ---@param expected integer Expected `vim.fn.winline()` value.
 ---@return integer new_expected The (potentially corrected) winline value to use as the expectation for the next tick.
 local function correct_drift(expected)
-  local actual = vim.fn.winline()
+  local actual = fn_winline()
   local drift = actual - expected
 
   if drift == 0 then
@@ -238,20 +274,20 @@ local function correct_drift(expected)
   end
 
   -- Clamp corrections to avoid runaway loops
-  local corrections = math.min(math.abs(drift), 3)
+  local corrections = math_min(math_abs(drift), 3)
   if drift > 0 then
     -- Cursor is too low — move it up
     for _ = 1, corrections do
-      vim.cmd.normal({ bang = true, args = { "gk" } })
+      cmd_normal({ bang = true, args = { "gk" } })
     end
   else
     -- Cursor is too high — move it down
     for _ = 1, corrections do
-      vim.cmd.normal({ bang = true, args = { "gj" } })
+      cmd_normal({ bang = true, args = { "gj" } })
     end
   end
 
-  return vim.fn.winline()
+  return fn_winline()
 end
 
 --- Check whether the viewport has hit a scroll boundary.
@@ -271,12 +307,13 @@ end
 local function at_boundary(scroll_mode, prev)
   if scroll_mode == "cursor" then
     -- Cursor-led: check if cursor actually moved
-    local new_lnum = vim.fn.line(".")
-    local new_col = vim.fn.col(".")
+    local new_lnum = fn_line(".")
+    local new_col = fn_col(".")
     return new_lnum == prev.lnum and new_col == prev.col
   else
     -- Viewport-led: check if topline changed
-    local new_topline = vim.fn.winsaveview().topline
+    -- fn_line('w0') returns topline without allocating a full view table
+    local new_topline = fn_line("w0")
     return new_topline == prev.topline
   end
 end
@@ -290,6 +327,12 @@ end
 --- Extracted so it can be called directly or inside `nvim_win_call` depending
 --- on whether the target window is the current window.
 ---
+--- In `"viewport"` mode, when the viewport hits a buffer boundary (top or
+--- bottom), remaining lines in the tick and subsequent ticks fall back to
+--- cursor movement (`gj`/`gk`) instead of stopping the animation.  This
+--- ensures that, e.g., scrolling up past the top of the buffer continues
+--- moving the cursor toward line 1 rather than halting.
+---
 ---@return boolean finished `true` if the animation should stop after this tick.
 ---@return fun()|nil on_complete Callback to invoke after stopping (if any).
 local function tick_inner(anim)
@@ -297,20 +340,67 @@ local function tick_inner(anim)
   local lines_this_tick = anim.lines_per_tick[anim.step_index]
 
   for _ = 1, lines_this_tick do
-    -- Snapshot state before scroll for boundary detection
-    local prev
-    if anim.scroll_mode == "cursor" then
-      prev = { lnum = vim.fn.line("."), col = vim.fn.col(".") }
+    -- In viewport mode, once we've detected a viewport boundary, all
+    -- remaining lines are scrolled via cursor movement (gj/gk).
+    if anim.viewport_at_boundary then
+      local prev_lnum = fn_line(".")
+      local prev_col = fn_col(".")
+      scroll_one_line(anim.direction, "cursor")
+      -- If the cursor can't move either, we're truly at the boundary
+      if fn_line(".") == prev_lnum and fn_col(".") == prev_col then
+        return true, anim.on_complete
+      end
     else
-      prev = { topline = vim.fn.winsaveview().topline }
-    end
+      -- Bottom boundary detection for viewport mode: when scrolling down,
+      -- check whether enough empty ~ lines have appeared below the last
+      -- buffer line BEFORE scrolling.  This prevents one extra <C-e> from
+      -- slipping through before the cursor-movement fallback kicks in.
+      if
+        anim.scroll_mode == "viewport"
+        and anim.direction == 1
+        and fn_line("w$") >= anim.last_buf_line
+      then
+        local pos = fn_screenpos(anim.win, anim.last_buf_line, 1)
+        local last_line_winrow = pos.row - anim.win_top_row + 1
+        local empty_below = anim.win_body_height - last_line_winrow
+        if empty_below >= anim.viewport_bottom_margin then
+          anim.viewport_at_boundary = true
+        end
+      end
 
-    -- Execute one scroll line
-    scroll_one_line(anim.direction, anim.scroll_mode)
+      -- If we just detected the bottom boundary, don't scroll the viewport —
+      -- fall back to cursor movement on the next loop iteration.
+      if anim.viewport_at_boundary then
+        local prev_lnum = fn_line(".")
+        local prev_col = fn_col(".")
+        scroll_one_line(anim.direction, "cursor")
+        if fn_line(".") == prev_lnum and fn_col(".") == prev_col then
+          return true, anim.on_complete
+        end
+      else
+        -- Snapshot state before scroll for boundary detection
+        local prev
+        if anim.scroll_mode == "cursor" then
+          prev = { lnum = fn_line("."), col = fn_col(".") }
+        else
+          prev = { topline = fn_line("w0") }
+        end
 
-    -- Check if we hit a boundary
-    if at_boundary(anim.scroll_mode, prev) then
-      return true, anim.on_complete
+        -- Execute one scroll line
+        scroll_one_line(anim.direction, anim.scroll_mode)
+
+        -- Check if we hit a boundary (topline unchanged / cursor unmoved)
+        if at_boundary(anim.scroll_mode, prev) then
+          if anim.scroll_mode == "viewport" then
+            -- Viewport can't scroll any further — fall back to cursor
+            -- movement for the remaining lines in this tick and all
+            -- subsequent ticks.
+            anim.viewport_at_boundary = true
+          else
+            return true, anim.on_complete
+          end
+        end
+      end
     end
   end
 
@@ -343,7 +433,7 @@ local function tick()
   local anim = current
 
   -- Validate that the target window still exists
-  if not vim.api.nvim_win_is_valid(anim.win) then
+  if not nvim_win_is_valid(anim.win) then
     M.stop()
     return
   end
@@ -362,10 +452,10 @@ local function tick()
 
   -- Execute tick logic — in the target window context if not current
   local finished, on_complete
-  if anim.win == vim.api.nvim_get_current_win() then
+  if anim.win == nvim_get_current_win() then
     finished, on_complete = tick_inner(anim)
   else
-    finished, on_complete = vim.api.nvim_win_call(anim.win, function()
+    finished, on_complete = nvim_win_call(anim.win, function()
       return tick_inner(anim)
     end)
   end
@@ -397,13 +487,38 @@ end
 --- are distributed across ticks so the animation completes within
 --- `duration` ms regardless of the scroll distance.
 ---
+--- Return the number of screen lines remaining in `anim` that have not yet
+--- been scrolled.  The result is always non-negative.
+---@param anim SmoothScrollAnimationState
+---@return integer
+---@private
+local function remaining_lines(anim)
+  local rem = 0
+  for i = anim.step_index + 1, #anim.lines_per_tick do
+    rem = rem + anim.lines_per_tick[i]
+  end
+  return rem
+end
+
 --- A value of `0` for `lines` is a no-op.
 ---
 ---@param lines integer Number of screen lines to scroll. Positive = down, negative = up.
 ---@param opts? SmoothScrollOpts Per-call overrides merged on top of the global config.
 function M.scroll(lines, opts)
-  -- Interrupt any current animation
-  if M.is_scrolling then
+  -- Interrupt any current animation, optionally accumulating remaining
+  -- distance when scrolling in the same direction.
+  if M.is_scrolling and current then
+    local ib = (opts and opts.interrupt_behaviour)
+      or config.current.interrupt_behaviour
+    local new_dir = lines > 0 and 1 or -1
+    if ib == "accumulate" and current.direction == new_dir then
+      local rem = remaining_lines(current)
+      lines = lines + rem * new_dir
+      local abs_lines = math_abs(lines)
+      if abs_lines > MAX_ACCUMULATE_LINES then
+        lines = MAX_ACCUMULATE_LINES * new_dir
+      end
+    end
     M.stop()
   end
 
@@ -413,20 +528,24 @@ function M.scroll(lines, opts)
 
   local effective = config.resolve(opts)
   local direction = lines > 0 and 1 or -1
-  local total_lines = math.abs(lines)
+  local total_lines = math_abs(lines)
   local easing_fn = easing_mod.resolve(effective.easing)
-  local duration = effective.duration or 250
+  local raw_duration = effective.duration or 250
+  local duration = type(raw_duration) == "function"
+    and raw_duration(total_lines)
+    or raw_duration
   local max_fps = effective.max_fps or 60
   local scroll_mode = effective.scroll_mode or "cursor"
 
   -- Resolve target window: 0 / nil → current window ID
+  local cur_win = nvim_get_current_win()
   local win = (opts and opts.win and opts.win ~= 0)
     and opts.win
-    or vim.api.nvim_get_current_win()
+    or cur_win
 
   -- Non-current windows force viewport-only mode: we must not move the
   -- cursor in a window we don't own.
-  if win ~= vim.api.nvim_get_current_win() then
+  if win ~= cur_win then
     scroll_mode = "viewport"
   end
 
@@ -437,13 +556,58 @@ function M.scroll(lines, opts)
     return
   end
 
-  -- Capture expected_winline in the target window context
-  local expected_winline
-  if win == vim.api.nvim_get_current_win() then
-    expected_winline = vim.fn.winline()
+  -- Capture expected_winline and last_buf_line in the target window context
+  local expected_winline, last_buf_line
+  if win == cur_win then
+    expected_winline = fn_winline()
+    last_buf_line = fn_line("$")
   else
-    expected_winline = vim.api.nvim_win_call(win, vim.fn.winline)
+    expected_winline, last_buf_line = nvim_win_call(win, function()
+      return fn_winline(), fn_line("$")
+    end)
   end
+  ---@cast last_buf_line integer
+
+  -- Resolve viewport_bottom_margin: explicit config → scrolloff fallback
+  local viewport_bottom_margin = effective.viewport_bottom_margin
+  if viewport_bottom_margin == nil then
+    viewport_bottom_margin = vim.wo[win].scrolloff
+  end
+
+  -- Early exit: if already at the bottom boundary in viewport mode scrolling
+  -- down, don't start an animation at all.
+  if scroll_mode == "viewport" and direction == 1 then
+    local already_at_bottom = function()
+      if fn_line(".") ~= last_buf_line then
+        return false
+      end
+      if fn_line("w$") < last_buf_line then
+        return false
+      end
+      local info = fn_getwininfo(win)[1]
+      local pos = fn_screenpos(win, last_buf_line, 1)
+      local last_line_winrow = pos.row - info.winrow + 1
+      local empty_below = info.height - last_line_winrow
+      return empty_below >= viewport_bottom_margin
+    end
+
+    local at_bottom
+    if win == cur_win then
+      at_bottom = already_at_bottom()
+    else
+      at_bottom = nvim_win_call(win, already_at_bottom)
+    end
+
+    if at_bottom then
+      return
+    end
+  end
+
+  -- Cache window geometry once — winrow and body height don't change
+  -- during an animation, so we avoid calling getwininfo() on every tick.
+  local info = fn_getwininfo(win)[1]
+  local win_top_row = info.winrow
+  local win_body_height = info.height
 
   -- Set up animation state
   current = {
@@ -455,6 +619,11 @@ function M.scroll(lines, opts)
     expected_winline = expected_winline,
     on_complete = opts and opts.on_complete,
     win = win,
+    viewport_at_boundary = false,
+    last_buf_line = last_buf_line,
+    viewport_bottom_margin = viewport_bottom_margin,
+    win_top_row = win_top_row,
+    win_body_height = win_body_height,
   }
 
   -- Suppress events during animation
@@ -504,24 +673,24 @@ function M.scroll_to_target(native_cmd, opts)
   -- Resolve target window for the peek operations
   local win = (opts and opts.win and opts.win ~= 0)
     and opts.win
-    or vim.api.nvim_get_current_win()
+    or nvim_get_current_win()
 
   -- Peek the target position to measure topline delta.
   -- All operations (winsaveview, native_cmd, winrestview) must run in the
   -- target window context so that topline/cursor state is correct.
-  local topline_delta = vim.api.nvim_win_call(win, function()
-    local saved_view = vim.fn.winsaveview()
-    vim.cmd.normal({ bang = true, args = { native_cmd } })
-    local target_view = vim.fn.winsaveview()
+  local topline_delta = nvim_win_call(win, function()
+    local saved_view = fn_winsaveview()
+    cmd_normal({ bang = true, args = { native_cmd } })
+    local target_view = fn_winsaveview()
     local delta = target_view.topline - saved_view.topline
-    vim.fn.winrestview(saved_view)
+    fn_winrestview(saved_view)
     return delta
   end)
 
   -- If no viewport movement needed, just execute the command directly
   if topline_delta == 0 then
-    vim.api.nvim_win_call(win, function()
-      vim.cmd.normal({ bang = true, args = { native_cmd } })
+    nvim_win_call(win, function()
+      cmd_normal({ bang = true, args = { native_cmd } })
     end)
     return
   end
@@ -531,8 +700,8 @@ function M.scroll_to_target(native_cmd, opts)
   M.scroll(topline_delta, vim.tbl_extend("force", opts or {}, {
     win = win,
     on_complete = function()
-      vim.api.nvim_win_call(win, function()
-        vim.cmd.normal({ bang = true, args = { native_cmd } })
+      nvim_win_call(win, function()
+        cmd_normal({ bang = true, args = { native_cmd } })
       end)
     end,
   }))

@@ -120,6 +120,7 @@ keymaps = {
   ["G"] = false,
 }
 ```
+You can also set `keymaps = false` to disable all default keymaps if you prefer to call the API functions directly or set up your own bindings.
 
 ## API
 
