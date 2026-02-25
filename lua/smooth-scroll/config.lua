@@ -100,9 +100,9 @@ local M = {}
 ---
 ---@type SmoothScrollConfig
 M.defaults = {
-  duration = function(lines) return lines * 12 end,
+  duration = function(lines) return lines * 10 end,
   easing = "linear",
-  max_fps = 60,
+  max_fps = 200,
   scroll_mode = "viewport",
   disable_events = true,
   mouse_wheel_lines = 3,
