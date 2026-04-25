@@ -198,4 +198,4 @@ the target, then re-executes the command for exact final positioning.
 
 ## License
 
-MIT
+Please see the LICENSE file in the repository for license information.
