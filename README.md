@@ -25,7 +25,7 @@ configurable easing, duration, and frame rate.
 
 ```lua
 {
-  "abhinav/smooth-scroll.nvim",
+  "abhinavnatarajan/smooth-scroll.nvim",
   opts = {},
 }
 ```
@@ -34,7 +34,7 @@ configurable easing, duration, and frame rate.
 
 ```lua
 use {
-  "abhinav/smooth-scroll.nvim",
+  "abhinavnatarajan/smooth-scroll.nvim",
   config = function()
     require("smooth-scroll").setup()
   end,
