@@ -342,6 +342,7 @@ end
 --- ensures that, e.g., scrolling up past the top of the buffer continues
 --- moving the cursor toward line 1 rather than halting.
 ---
+---@param anim SmoothScrollAnimationState
 ---@return boolean finished `true` if the animation should stop after this tick.
 ---@return fun()|nil on_complete Callback to invoke after stopping (if any).
 local function tick_inner(anim)
@@ -576,11 +577,11 @@ function M.scroll(lines, opts)
 		expected_winline = fn_winline()
 		last_buf_line = fn_line("$")
 	else
-		expected_winline, last_buf_line = nvim_win_call(win, function()
-			return fn_winline(), fn_line("$")
+		local temp = nvim_win_call(win, function()
+			return { fn_winline(), fn_line("$") }
 		end)
+		expected_winline, last_buf_line = temp[1], temp[2]
 	end
-	---@cast last_buf_line integer
 
 	-- Resolve viewport_bottom_margin: explicit config → scrolloff fallback
 	local viewport_bottom_margin = effective_config.viewport_bottom_margin
