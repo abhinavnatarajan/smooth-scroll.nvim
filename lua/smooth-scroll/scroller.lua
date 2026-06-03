@@ -27,11 +27,7 @@ local cmd_normal = vim.cmd.normal
 local nvim_get_current_win = api.nvim_get_current_win
 local nvim_win_is_valid = api.nvim_win_is_valid
 local nvim_win_call = api.nvim_win_call
-local nvim_win_get_height = api.nvim_win_get_height
-local nvim_get_option_value = api.nvim_get_option_value
-
 local fn_line = fn.line
-local fn_col = fn.col
 local fn_winline = fn.winline
 local fn_winsaveview = fn.winsaveview
 local fn_winrestview = fn.winrestview
@@ -50,11 +46,11 @@ local math_abs = math.abs
 
 --- Terminal code for `<C-e>` (scroll viewport down by one screen line).
 ---@type string
-local CTRL_E = api.nvim_replace_termcodes("<C-e>", false, false, true)
+local CTRL_E = vim.keycode("<C-e>")
 
 --- Terminal code for `<C-y>` (scroll viewport up by one screen line).
 ---@type string
-local CTRL_Y = api.nvim_replace_termcodes("<C-y>", false, false, true)
+local CTRL_Y = vim.keycode("<C-y>")
 
 ---------------------------------------------------------------------------
 -- Timer & animation state
@@ -67,8 +63,11 @@ local CTRL_Y = api.nvim_replace_termcodes("<C-y>", false, false, true)
 local MAX_ACCUMULATE_LINES = 200
 
 --- Single reused libuv timer for the plugin's lifetime.
----@type uv_timer_t
-local timer = vim.uv.new_timer()
+local timer, err = vim.uv.new_timer()
+if not timer then
+	vim.notify("smooth-scroll.nvim: Could not get timer for scroller. " .. err, vim.log.levels.ERROR)
+end
+---@cast timer uv.uv_timer_t
 
 --- Internal state for a running animation.
 ---
