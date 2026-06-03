@@ -5,15 +5,13 @@ configurable easing, duration, and frame rate.
 
 ## Features
 
-- Smooth animation for `<C-d>`, `<C-u>`, `<C-f>`, `<C-b>`, `gg`, `G`, `zt`,
-  `zz`, `zb`, `n`, `N`, and mouse wheel scrolling
-- Correct handling of soft-wrapped lines and folded regions (all scrolling
-  operates on screen lines, not buffer lines)
-- 5 built-in easing functions, or supply your own
-- Per-motion overrides for duration, easing, and cursor behavior
-- Interrupt-friendly: new scroll input cancels the current animation instantly
-- Optional event suppression during animation to avoid autocmd noise
-- Works in normal, visual, and insert modes (where applicable)
+- Smooth animation for `<C-d>`, `<C-u>`, `<C-f>`, `<C-b>`, `gg`, `G`, `zt`, `zz`, `zb`, `n`, `N`, and mouse wheel scrolling.
+- Correct handling of soft-wrapped lines and folded regions (all scrolling operates on screen lines, not buffer lines).
+- 5 built-in easing functions, or supply your own.
+- Per-motion overrides for duration, easing, and cursor behavior.
+- Interrupt-friendly: new scroll input cancels the current animation instantly.
+- Optional event suppression during animation to avoid autocmd noise.
+- Works in normal, visual, and insert modes (where applicable).
 
 ## Requirements
 
