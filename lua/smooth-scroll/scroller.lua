@@ -86,6 +86,7 @@ end
 ---@field viewport_at_boundary boolean When `true`, the viewport has hit a buffer boundary during a `"viewport"` mode animation. Subsequent lines fall back to cursor movement (`gj`/`gk`) instead of stopping the animation.
 ---@field last_buf_line integer Total number of buffer lines (`vim.fn.line("$")`), precomputed at animation start for bottom boundary detection.
 ---@field viewport_bottom_margin integer Number of empty `~` lines below the last buffer line that triggers cursor-movement fallback when scrolling down in `"viewport"` mode.
+---@field token integer Generation token used to ignore stale scheduled timer callbacks.
 
 --- The currently-running animation, or `nil` when idle.
 ---@type SmoothScrollAnimationState?
@@ -94,6 +95,16 @@ local currentAnimationState = nil
 --- Whether an animation is currently in progress.
 ---@type boolean
 M.is_scrolling = false
+
+--- Monotonically increasing token for invalidating already-scheduled timer callbacks.
+---@type integer
+local animation_token = 0
+
+---@return integer token Fresh animation token.
+local function next_animation_token()
+	animation_token = animation_token + 1
+	return animation_token
+end
 
 ---------------------------------------------------------------------------
 -- Public: stop
@@ -108,6 +119,7 @@ function M.stop()
 		return
 	end
 	timer:stop()
+	next_animation_token()
 	M.is_scrolling = false
 	-- Restore event settings
 	if currentAnimationState and currentAnimationState.saved_eventignore then
@@ -331,6 +343,9 @@ end
 -- Internal: timer callback
 ---------------------------------------------------------------------------
 
+---@type fun(anim: SmoothScrollAnimationState, interval: number)|nil
+local schedule_tick
+
 --- Core tick logic — scrolls lines, checks boundaries, corrects drift.
 ---
 --- Extracted so it can be called directly or inside `nvim_win_call` depending
@@ -436,19 +451,19 @@ end
 ---
 --- Advances the animation by one step: scrolls one or more screen lines
 --- (determined by `lines_per_tick`), checks for boundary conditions, corrects
---- drift, and adjusts the timer repeat interval for the next tick.  Stops the
---- animation when all steps are consumed or a boundary is reached.
+--- drift, and schedules the next one-shot timer only after the current tick has
+--- completed. Stops the animation when all steps are consumed or a boundary is
+--- reached.
 ---
 --- When the target window is not the current window, all window-dependent
 --- operations are executed inside `nvim_win_call` so that `vim.cmd.normal`,
 --- `vim.fn.winline()`, etc. operate on the correct window.
-local function tick()
-	if not currentAnimationState or not M.is_scrolling then
-		M.stop()
+---@param token integer Animation token captured when this timer tick was scheduled.
+local function tick(token)
+	local anim = currentAnimationState
+	if not anim or not M.is_scrolling or anim.token ~= token then
 		return
 	end
-
-	local anim = currentAnimationState
 
 	-- Validate that the target window still exists
 	if not nvim_win_is_valid(anim.win) then
@@ -482,10 +497,30 @@ local function tick()
 		return
 	end
 
-	-- Set the interval for the next tick
-	if anim.step_index < #anim.steps then
-		timer:set_repeat(anim.steps[anim.step_index + 1])
+	if anim.step_index >= #anim.steps then
+		local complete = anim.on_complete
+		M.stop()
+		if complete then
+			complete()
+		end
+		return
 	end
+
+	-- Schedule the next one-shot tick only after this tick has completed. This
+	-- avoids building a backlog of scheduled callbacks while input is pending.
+	if schedule_tick then
+		schedule_tick(anim, anim.steps[anim.step_index + 1])
+	end
+end
+
+schedule_tick = function(anim, interval)
+	timer:start(
+		interval,
+		0,
+		vim.schedule_wrap(function()
+			tick(anim.token)
+		end)
+	)
 end
 
 ---------------------------------------------------------------------------
@@ -639,6 +674,7 @@ function M.scroll(lines, opts)
 		viewport_bottom_margin = viewport_bottom_margin,
 		win_top_row = win_top_row,
 		win_body_height = win_body_height,
+		token = next_animation_token(),
 	}
 
 	-- Suppress events during animation
@@ -649,15 +685,11 @@ function M.scroll(lines, opts)
 
 	M.is_scrolling = true
 
-	-- Start the timer: first tick after intervals[1] ms, then repeating
-	local first_interval = intervals[1]
-	local repeat_interval = intervals[2] or first_interval
-
-	timer:start(
-		first_interval,
-		repeat_interval,
-		vim.schedule_wrap(tick)
-	)
+	-- Start the one-shot timer chain. Each subsequent tick is scheduled only
+	-- after the previous tick has run, so pending input can interrupt promptly.
+	if schedule_tick then
+		schedule_tick(currentAnimationState, intervals[1])
+	end
 end
 
 ---------------------------------------------------------------------------

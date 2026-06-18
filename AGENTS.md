@@ -49,11 +49,23 @@ always sum to exactly `duration` ms — duration is authoritative.
 tick). `max_fps` (clamped to [1, 250]) determines the maximum number of frames:
 `max_frames = floor(duration_ms * max_fps / 1000)`.
 
-### Single reused timer
+### Single reused one-shot timer
 
 One `vim.uv.new_timer()` is created for the plugin's lifetime. It is
 stopped/restarted per animation. This avoids GC pressure from creating timers on
 every scroll.
+
+The timer is intentionally used as a **one-shot chain**, not a repeating timer:
+each tick schedules the next tick only after the current tick has completed. This
+prevents libuv timer firings from building up a backlog of `vim.schedule()`d
+callbacks while Neovim is busy processing animation work or user input. The
+animation also stops immediately after the last scheduled step rather than
+waiting for an extra timer interval.
+
+Each animation gets a monotonically increasing token. Scheduled callbacks capture
+that token and no-op if it no longer matches the active animation. This protects
+new animations from stale callbacks that were already scheduled before an
+interruption or direction change.
 
 ### Interruption behaviour
 
